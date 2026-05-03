@@ -4,8 +4,19 @@ import sqlite3
 import requests
 import pandas as pd
 import ccxt
+import logging
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Configure logging to both file and console with automatic timestamps
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -17,7 +28,7 @@ TRADING_CONFIG = [
 ]
 
 def setup_database():
-    print("Initializing SQLite database...")
+    logging.info("Initializing SQLite database...")
     db_name = os.getenv('DB_NAME', 'paper_trading.db')
     with sqlite3.connect(db_name) as conn:
         cursor = conn.cursor()
@@ -37,12 +48,12 @@ def setup_database():
         conn.commit()
 
 def get_market_data(exchange_id, symbol, timeframe, limit=1000):
-    print(f"Connecting to {exchange_id.upper()}...")
+    logging.info(f"Connecting to {exchange_id.upper()}...")
     
     exchange_class = getattr(ccxt, exchange_id)
     exchange = exchange_class()
     
-    print(f"Getting data for {symbol} - {timeframe}")
+    logging.info(f"Fetching data for {symbol} - {timeframe}")
 
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     
@@ -66,7 +77,7 @@ def get_market_data(exchange_id, symbol, timeframe, limit=1000):
     return df 
 
 def get_ai_decision(df):
-    print("Processing data for AI decision...")
+    logging.info("Processing market data for AI decision...")
     last_data = df.tail(15).to_dict(orient='records')
 
     for row in last_data:
@@ -95,7 +106,7 @@ def get_ai_decision(df):
 
     groq_key = os.getenv('GROQ_API_KEY')
     if not groq_key:
-        print("CRITICAL ERROR: GROQ_API_KEY not found in .env file.")
+        logging.error("GROQ_API_KEY not found in .env file.")
         return {"action": "HOLD", "reasoning": "Missing Groq API Key."}
 
     url = os.getenv('GROQ_API_URL', 'https://api.groq.com/openai/v1/chat/completions')
@@ -126,13 +137,12 @@ def get_ai_decision(df):
         response.raise_for_status() 
         ai_text = response.json()['choices'][0]['message']['content']
         return json.loads(ai_text)
-    except Exception as e:
-        # SANITIZED: Replaced raw error printing with a generic message to prevent data leakage
-        print("Error querying the Cloud AI: Network timeout or invalid response structure.")
+    except Exception:
+        logging.error("Cloud AI Query failed: Network error or invalid response.")
         return {"action": "HOLD", "reasoning": "Security fallback due to Cloud API error."}
 
 def log_trade(exchange_id, symbol, current_price, current_sma, current_rsi, decision):
-    print("Saving decision to database with indicator states...")
+    logging.info("Saving decision to database...")
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db_name = os.getenv('DB_NAME', 'paper_trading.db')
     
@@ -145,15 +155,12 @@ def log_trade(exchange_id, symbol, current_price, current_sma, current_rsi, deci
         conn.commit()
 
 def execute_trade(exchange_id, symbol, action, current_price, test_mode=True):
-    """
-    Executes a market order calculating the amount dynamically based on wallet balance.
-    """
-    # 1. Security validation against AI hallucinations
+    # Security validation against AI hallucinations
     if action not in ["BUY", "SELL"]:
-        print(f"No action required (or invalid action '{action}') for {symbol} on {exchange_id}.")
+        logging.info(f"No trade action required for {symbol} on {exchange_id} (Action: {action}).")
         return False
 
-    print(f"Preparing to execute {action} order for {symbol} on {exchange_id}...")
+    logging.info(f"Initiating {action} sequence for {symbol} on {exchange_id}...")
 
     try:
         exchange_class = getattr(ccxt, exchange_id)
@@ -161,7 +168,7 @@ def execute_trade(exchange_id, symbol, action, current_price, test_mode=True):
         api_secret = os.getenv(f"{exchange_id.upper()}_API_SECRET")
         
         if not api_key or not api_secret:
-             print(f"Error: Missing API credentials for {exchange_id.upper()}.")
+             logging.error(f"Missing API credentials for {exchange_id.upper()}.")
              return False
 
         exchange = exchange_class({
@@ -170,51 +177,49 @@ def execute_trade(exchange_id, symbol, action, current_price, test_mode=True):
             'enableRateLimit': True,
         })
         
-        # 2. Read the wallet balance
-        balance = exchange.fetch_balance()
-        base_currency = symbol.split('/')[0]   # Ex: XRP
-        quote_currency = symbol.split('/')[1]  # Ex: MXN or USDT
-        
-        risk_percentage = 0.05  # Only risk 5% of the available balance per trade
+        # Risk management: Calculate amount based on wallet balance
+        base_currency = symbol.split('/')[0]
+        quote_currency = symbol.split('/')[1]
+        risk_percentage = 0.05
         amount = 0
         
-        if action == "BUY":
-            # To buy XRP, check how much fiat (MXN/USDT) is available
-            available_quote = balance.get(quote_currency, {}).get('free', 0.0)
-            spend_amount = available_quote * risk_percentage
-            if current_price > 0:
-                amount = spend_amount / current_price # Convert fiat to crypto amount
-                
-        elif action == "SELL":
-            # To sell XRP, check how much crypto is available
-            available_base = balance.get(base_currency, {}).get('free', 0.0)
-            amount = available_base * risk_percentage # Sell only 5% of your coins
+        if test_mode:
+            logging.info(f"[TEST MODE] Skipping live balance fetch. Using simulated risk amount.")
+            # Set a fixed simulated amount for testing purposes
+            amount = 10.0
+        else:
+            balance = exchange.fetch_balance()
+            if action == "BUY":
+                available_quote = balance.get(quote_currency, {}).get('free', 0.0)
+                spend_amount = available_quote * risk_percentage
+                if current_price > 0:
+                    amount = spend_amount / current_price
+            elif action == "SELL":
+                available_base = balance.get(base_currency, {}).get('free', 0.0)
+                amount = available_base * risk_percentage
 
-        # 3. Minimum balance validation
         if amount <= 0:
-            print(f"Trade aborted: Calculated amount is zero. Insufficient free balance in wallet.")
+            logging.warning(f"Trade aborted: Amount is zero. Check {exchange_id} wallet balance.")
             return False
 
-        print(f"Calculated dynamic trade size: {amount:.4f} {base_currency} (Using {risk_percentage*100}% of available balance)")
+        logging.info(f"Calculated trade size: {amount:.4f} {base_currency} ({risk_percentage*100}% risk)")
 
         if test_mode:
-             print(f"[TEST MODE] Simulated {action} of {amount:.4f} {symbol} completed successfully.")
+             logging.info(f"[TEST MODE] Simulated {action} of {amount:.4f} {symbol} successful.")
              return True
 
-        # LIVE RISK ZONE (test_mode=False)
+        # LIVE EXECUTION
         side = action.lower() 
         order = exchange.create_market_order(symbol, side, amount)
-        print(f"[LIVE MODE] Order executed successfully. Order ID logged securely.")
+        logging.info(f"[LIVE MODE] Order executed successfully. ID: {order.get('id')}")
         return True
 
     except ccxt.InsufficientFunds:
-        print(f"Error: Insufficient funds on {exchange_id}. Trade aborted gracefully.")
+        logging.error(f"Insufficient funds on {exchange_id} to complete {action}.")
     except Exception:
-        # SANITIZED: No longer printing raw error to prevent info leaks in the log
-        print(f"Execution error on {exchange_id}: API connection failed, network timeout, or order rejected.")
+        logging.error(f"Execution failed on {exchange_id}: API error or connection timeout.")
         
     return False
-
 
 if __name__ == "__main__":
     setup_database()
@@ -224,7 +229,7 @@ if __name__ == "__main__":
         symbol = config["symbol"]
         timeframe = config["timeframe"]
         
-        print(f"\n--- Starting analysis for {exchange_id.upper()} ({symbol}) ---")
+        logging.info(f"--- Starting analysis for {exchange_id.upper()} ({symbol}) ---")
         
         try:
             data = get_market_data(exchange_id, symbol, timeframe, 1000)
@@ -236,15 +241,15 @@ if __name__ == "__main__":
             decision = get_ai_decision(data)
             action = decision.get('action')
             
-            print(f"DECISION FOR {exchange_id.upper()}: {action}")
-            print(f"REASONING: {decision.get('reasoning')}")
+            logging.info(f"AI Decision: {action}")
+            logging.info(f"Reasoning: {decision.get('reasoning')}")
             
             log_trade(exchange_id, symbol, current_price, current_sma, current_rsi, decision)
             
             # Execute trade with test_mode=True for safety
             execute_trade(exchange_id, symbol, action, current_price, test_mode=True)
             
-        except Exception as e:
-            print(f"Critical error processing {exchange_id}: {e}")
+        except Exception:
+            logging.error(f"Critical error during {exchange_id.upper()} analysis cycle.")
             
-    print("\nRun completed successfully for all configured exchanges.")
+    logging.info("Run completed successfully for all configured exchanges.\n")
